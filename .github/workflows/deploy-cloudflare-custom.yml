@@ -1,4 +1,10 @@
-name: 🚀 Deploy cloud-mail to Cloudflare Workers
+# ⚠️ 本文件是本仓库自定义的部署 workflow（RolinShmily 维护）。
+# 原上游文件 .github/workflows/deploy-cloudflare.yml 保持尽量不动，便于后期平滑同步上游。
+# 相比上游原版，本文件额外包含 3 个 CI 修复：
+#   1. CUSTOM_DOMAIN 清洗（去首尾空白 / https:// 前缀 / 尾部斜杠）—— 修复 Cloudflare 100113 invalid hostname
+#   2. 部署容错：域名 DNS 记录已存在（code 100117 / externally managed）时不再标红
+#   3. 数据库初始化：多候选 URL 降级（自定义域名 → workers.dev）+ 每地址最多重试 3 次
+name: 🚀 Deploy cloud-mail (custom) to Cloudflare Workers
 
 on:
   push:
@@ -10,10 +16,10 @@ on:
 
 jobs:
   Deploy-cloud-mail:
-    name: 🏗️ Build and Deploy
+    name: 🏗️ Build and Deploy (custom)
     runs-on: ubuntu-latest
-    # 仅上游仓库运行；本仓库的实际部署由 deploy-cloudflare-custom.yml 负责（避免双 workflow 重复部署）
-    if: github.repository == 'maillab/cloud-mail'
+    # 仅在本仓库（非上游 maillab/cloud-mail）运行，避免与上游原版 workflow 重复部署
+    if: github.repository != 'maillab/cloud-mail'
 
     env:
       NAME: ${{ secrets.NAME || vars.NAME || 'cloud-mail' }}
@@ -95,6 +101,15 @@ jobs:
             echo "::warning:: CUSTOM_DOMAIN variable is not set."
           fi
           
+          # 🔧 修复1：清洗 CUSTOM_DOMAIN —— 去首尾空白、去 http(s):// 前缀、去尾部斜杠
+          # 防止把带空格/协议头的值传给 Cloudflare，导致 code 100113 invalid hostname
+          CLEANED_CUSTOM_DOMAIN=$(echo "$CUSTOM_DOMAIN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's|^https://||' -e 's|^http://||' -e 's|/*$||')
+          echo "CUSTOM_DOMAIN=$CLEANED_CUSTOM_DOMAIN" >> $GITHUB_ENV
+          
+          if [ -z "$CLEANED_CUSTOM_DOMAIN" ]; then
+            echo "::warning:: CUSTOM_DOMAIN is empty after cleaning. Original value: '$CUSTOM_DOMAIN'"
+          fi
+          
           CONFIG_FILE="wrangler-action.toml"
           
           if [ -z "$R2_BUCKET_NAME" ]; then
@@ -105,7 +120,7 @@ jobs:
             sed -i '/^project_link = /d' "$CONFIG_FILE"
           fi
           
-          if [ -z "$CUSTOM_DOMAIN" ]; then
+          if [ -z "$CLEANED_CUSTOM_DOMAIN" ]; then
             sed -i '/\[\[routes\]\]/,/^$/d' "$CONFIG_FILE"
           fi
           
@@ -118,7 +133,7 @@ jobs:
           fi
 
           sed -i "s|\${NAME}|${NAME}|g" "$CONFIG_FILE"
-          sed -i "s|\${CUSTOM_DOMAIN}|${CUSTOM_DOMAIN}|g" "$CONFIG_FILE"
+          sed -i "s|\${CUSTOM_DOMAIN}|${CLEANED_CUSTOM_DOMAIN}|g" "$CONFIG_FILE"
           sed -i "s|\"\${DOMAIN}\"|${DOMAIN}|g" "$CONFIG_FILE"
           sed -i "s|\${ADMIN}|${ADMIN}|g" "$CONFIG_FILE"
           sed -i "s|\${JWT_SECRET}|${JWT_SECRET}|g" "$CONFIG_FILE"
@@ -221,7 +236,19 @@ jobs:
           
           DEPLOY_EXIT_CODE=${PIPESTATUS[0]}
           if [ $DEPLOY_EXIT_CODE -ne 0 ]; then
-            exit 1
+            # 🔧 修复2：若部署失败是因为自定义域名 DNS 记录已存在（code 100117 / externally managed），
+            # 说明 Worker 脚本实际已上传成功，仅域名绑定需人工处理 —— 不标红，改为警告。
+            # 但 code 100113（域名格式非法）属于配置错误，仍要显式失败。
+            if grep -q "code: 100113" deploy.log; then
+              echo "❌ CUSTOM_DOMAIN 仍不是合法 DNS 域名（code 100113）。请检查 GitHub 变量值是否包含空格等非法字符。"
+              exit 1
+            fi
+            if grep -q -E "Uploaded|already has externally managed DNS records|code: 100117" deploy.log; then
+              echo "::warning:: Custom domain record already exists or requires manual DNS setup (code 100117), but Worker script was successfully uploaded."
+            else
+              echo "❌ Deployment failed."
+              exit 1
+            fi
           fi
           
           WORKER_URL=$(grep -o "https://.*\.workers\.dev" deploy.log || echo "")
@@ -238,21 +265,49 @@ jobs:
           echo "🛠️ Starting database initialization..."
           sleep 15
           
-          WORKER_URL="${CUSTOM_DOMAIN:+https://$CUSTOM_DOMAIN}"
-          WORKER_URL="${WORKER_URL:-${{ steps.deploy.outputs.worker_url }}}"
-          
-          if [ -z "$WORKER_URL" ]; then
-            echo "❌ Preview URL not available. Please set CUSTOM_DOMAIN."
+          # 🔧 修复3：数据库初始化改为多候选 URL 降级 + 重试。
+          # 优先试真实自定义域名（清洗后），失败回退 workers.dev 地址；每个地址最多重试 3 次。
+          CLEAN_CUSTOM=""
+          if [ -n "$CUSTOM_DOMAIN" ]; then
+            CLEAN_CUSTOM=$(echo "$CUSTOM_DOMAIN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's|^https://||' -e 's|^http://||' -e 's|/*$||')
+          fi
+
+          URLS_TO_TRY=()
+          if [ -n "$CLEAN_CUSTOM" ]; then
+            URLS_TO_TRY+=("https://$CLEAN_CUSTOM")
+          fi
+          WORKER_DEV_URL="${{ steps.deploy.outputs.worker_url }}"
+          if [ -n "$WORKER_DEV_URL" ]; then
+            URLS_TO_TRY+=("$WORKER_DEV_URL")
+          fi
+
+          if [ ${#URLS_TO_TRY[@]} -eq 0 ]; then
+            echo "❌ Preview URL not available. Please set CUSTOM_DOMAIN or enable workers.dev."
             exit 1
           fi
           
-          HTTP_CODE=$(curl -sL -w "%{http_code}" -o response.txt "$WORKER_URL/api/init/${JWT_SECRET}")
-          RESPONSE_BODY=$(cat response.txt)
+          INIT_SUCCESS=false
+          for TARGET_URL in "${URLS_TO_TRY[@]}"; do
+            echo "🔍 Attempting initialization at: $TARGET_URL"
+            for i in {1..3}; do
+              HTTP_CODE=$(curl -sL -w "%{http_code}" -o response.txt "$TARGET_URL/api/init/${JWT_SECRET}" || echo "000")
+              RESPONSE_BODY=$(cat response.txt 2>/dev/null || echo "")
 
-          if [ "$RESPONSE_BODY" = "success" ]; then
-            echo "✅ Setup completed."
-          else
-            echo "❌ Failed. HTTP: $HTTP_CODE, Response: $RESPONSE_BODY"
+              if [ "$RESPONSE_BODY" = "success" ]; then
+                echo "✅ Database initialized successfully on $TARGET_URL."
+                INIT_SUCCESS=true
+                break 2
+              else
+                echo "⚠️ Attempt $i failed on $TARGET_URL. HTTP: $HTTP_CODE, Response: $RESPONSE_BODY"
+                if [ $i -lt 3 ]; then
+                  sleep 5
+                fi
+              fi
+            done
+          done
+
+          if [ "$INIT_SUCCESS" = false ]; then
+            echo "❌ Failed to initialize database on all attempted URLs."
             exit 1
           fi
 
