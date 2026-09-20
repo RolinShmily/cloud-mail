@@ -317,3 +317,11 @@ jobs:
         with:
           retain_days: '1'
           keep_minimum_runs: '0'
+
+  # 🪝 自动联动：部署第二个 Worker（Webhook 中继：Cloud Mail → 飞书格式转换）
+  # 复用 deploy-lark-hook.yml（on: workflow_call），在主部署完成后顺序执行，一次 Run 内完成两个 Worker 部署
+  Deploy-webhook-relay:
+    name: 🪝 Deploy Webhook Relay (Lark/Feishu)
+    needs: Deploy-cloud-mail
+    uses: ./.github/workflows/deploy-lark-hook.yml
+    secrets: inherit

@@ -1,0 +1,5 @@
+# Webhook 中继 Worker（Cloud Mail → 飞书格式转换）
+# 不写任何 [vars]/[secrets]：敏感值由 CI 通过 wrangler deploy --var 注入（来自 GitHub Secrets）
+name = "webhook-relay"
+main = "src/index.js"
+compatibility_date = "2025-08-01"

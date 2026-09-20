@@ -1,0 +1,73 @@
+# 🪝 Webhook 中继 Worker 部署（Cloud Mail → 飞书/Lark 格式转换）
+# 三种触发方式：
+#   1. workflow_call —— 被 deploy-cloudflare-custom.yml 的「Deploy-webhook-relay」job 自动调用（一次 Run 顺序执行）
+#   2. push —— 仅当 .github/webhook-relay/** 下的中继代码变化时自动部署
+#   3. workflow_dispatch —— 手动触发
+#
+# 所需 GitHub Secrets（在仓库 Settings → Secrets 配置）：
+#   FEISHU_WEBHOOK  必填：飞书机器人 Webhook URL（https://open.feishu.cn/open-apis/bot/v2/hook/xxx）
+#   WEBHOOK_SECRET  选填：与 Cloud Mail webhook 设置里的第二个输入框对应，用于校验 Authorization 头
+# 复用 deploy-cloudflare-custom.yml 里的 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID。
+name: 🪝 Deploy Webhook Relay (Lark/Feishu)
+
+on:
+  workflow_call:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/webhook-relay/**"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-webhook-relay
+  cancel-in-progress: true
+
+jobs:
+  Deploy-relay:
+    name: 🚀 Deploy webhook relay
+    runs-on: ubuntu-latest
+    # 仅本仓库（非上游 maillab/cloud-mail）运行
+    if: github.repository != 'maillab/cloud-mail'
+
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+      WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+
+    steps:
+      - name: 🚚 检出代码仓库 / Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🪝 部署中继 Worker / Deploy relay worker
+        working-directory: .github/webhook-relay
+        run: |
+          set -e
+
+          if [ -z "$FEISHU_WEBHOOK" ]; then
+            echo "❌ GitHub Secret FEISHU_WEBHOOK 未配置。请先在仓库 Settings → Secrets 添加飞书机器人 Webhook 地址。"
+            exit 1
+          fi
+
+          # 组装 --var 参数（值来自 GitHub Secrets，不写入仓库代码）
+          DEPLOY_ARGS=("--var" "FEISHU_WEBHOOK:$FEISHU_WEBHOOK")
+          if [ -n "$WEBHOOK_SECRET" ]; then
+            DEPLOY_ARGS+=("--var" "WEBHOOK_SECRET:$WEBHOOK_SECRET")
+          fi
+
+          echo "🚀 Deploying webhook-relay worker..."
+          DEPLOY_OUTPUT=$(npx --yes wrangler@4.135.0 deploy "${DEPLOY_ARGS[@]}" 2>&1) || {
+            echo "$DEPLOY_OUTPUT"
+            echo "❌ Webhook relay deployment failed."
+            exit 1
+          }
+
+          # 提取 workers.dev 地址，方便回填到 Cloud Mail 设置
+          URL=$(echo "$DEPLOY_OUTPUT" | grep -oE "https://[a-z0-9-]+\.workers\.dev" | head -1 || echo "")
+          echo "$DEPLOY_OUTPUT"
+          if [ -n "$URL" ]; then
+            echo "✅ 中继部署成功。请在 Cloud Mail 的后台设置 Webhook URL 为:"
+            echo "::notice::Webhook URL: $URL  (第二个输入框可不填；若填了 WebhookSecret，请同时配置 GitHub Secret WEBHOOK_SECRET)"
+          else
+            echo "::warning::未在输出中找到 workers.dev 地址，请确认账号已启用 workers.dev subdomain。"
+          fi
