@@ -151,6 +151,8 @@ git push origin main                # 推送本仓库
 - **部署红但日志有 `Uploaded cloud-mail`**：多半命中 100117 容错分支或新错误码，检查 `CUSTOM_DOMAIN` 格式与小字 warning。
 - **relay 部署报 `FEISHU_WEBHOOK 未配置`**：GitHub Secret 未添加，添加后重跑。
 - **推送全 401**：`WEBHOOK_SECRET` 已配但 Cloud Mail ②号框留空（或值不一致），见 §5 成对约束表。
+- **Cloud Mail 报推送失败（中继回 502，响应含飞书 code=19001/签名类错误）**：飞书机器人开了「加签」但中继不计算签名。
+  处理：飞书机器人安全设置关闭加签，或升级中继支持加签（见 §5.1 决策记录）。
 - **飞书收不到消息但部署全绿**：先 GET 中继地址确认存活（`curl https://<relay>.<子域>.workers.dev` 应返回 `webhook-relay ok`）；
   再手动 `curl -X POST` 带 `Authorization: <你的密钥>` 和 fake payload 测中继；看 Cloud Mail 后台是否有 webhook 错误日志（会打印中继返回的 5xx 原因）。
 - **workers.dev 不可用**：账号未启用 workers.dev subdomain 时中继部署会告警，需为中继配置自定义路由（暂未内置，需要时按需加）。
